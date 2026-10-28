@@ -1,7 +1,7 @@
 /* METADATA
 {
     "name": "connect_workbuddy",
-    "version": "4.8.0",
+    "version": "4.8.1",
     "author": ["gukangran2026-source"],
     "display_name": {
         "zh": "operit-connect-workbuddy",
@@ -699,16 +699,92 @@ const WorkBuddyConnect = (function () {
             : String(result.output === undefined || result.output === null ? "" : result.output);
     }
 
-    /* 用 [w] 规避 pgrep/pkill 匹配到命令自身的问题 */
-    const WATCHDOG_PROBE = "pgrep -f '[w]atchdog.sh' >/dev/null 2>&1 && echo WATCHDOG_UP || echo WATCHDOG_DOWN";
-    const WATCHDOG_STOP = "pkill -f '[w]atchdog.sh' >/dev/null 2>&1";
-    const WATCHDOG_ENSURE = "if ! pgrep -f '[w]atchdog.sh' >/dev/null 2>&1 ; then (nohup bash watchdog.sh >/dev/null 2>&1 &) ; fi";
+    /* ------------------------------------------------------------------ *
+     * 服务进程管理
+     *
+     * 市场审核要求：不得用 pkill / pgrep 按通用进程名批量终止——进程名会命中
+     * 其它目录下的同名进程，误停无关插件或用户服务。这里改为：
+     *   1) 每个服务只用自己 pidfile 里的 PID；
+     *   2) 发信号前做归属校验：PID 存在 + UID 相同 + cmdline 含本服务目录下
+     *      的绝对路径，三条同时成立才动手；
+     *   3) 校验不通过只清 pidfile，不发任何信号；
+     *   4) 探活与启停全部限定在配置的服务目录。
+     * ------------------------------------------------------------------ */
+
+    const BRIDGE_PID_FILE_NAME = "bridge.pid";
+    const WATCHDOG_PID_FILE_NAME = "watchdog.pid";
+
+    /** 单引号安全转义：路径含空格或引号时不会被 shell 拆开。 */
+    function shq(value) {
+        const text = String(value === undefined || value === null ? "" : value);
+        return "'" + text.replace(/'/g, "'\\''") + "'";
+    }
+
+    /** 解析 probe_all 的输出，拿到带归属校验的 PID。 */
+    function parseServiceProbe(output) {
+        const text = String(output === undefined || output === null ? "" : output);
+        const bridge = /BRIDGE_UP\s+(\d+)/.exec(text);
+        const watchdog = /WATCHDOG_UP\s+(\d+)/.exec(text);
+        return {
+            bridgeUp: bridge !== null,
+            bridgePid: bridge === null ? 0 : Number(bridge[1]),
+            watchdogUp: watchdog !== null,
+            watchdogPid: watchdog === null ? 0 : Number(watchdog[1])
+        };
+    }
+
+    /** 探活：只认 pidfile + cmdline 里本目录的绝对路径，不按进程名扫。 */
+    function probeCommand() {
+        const dir = serviceDir();
+        const bridgePid = shq(dir + "/" + BRIDGE_PID_FILE_NAME);
+        const watchdogPid = shq(dir + "/" + WATCHDOG_PID_FILE_NAME);
+        const bridgePath = shq(dir + "/server.mjs");
+        const watchdogPath = shq(dir + "/watchdog.sh");
+        return [
+            `bp=$(cat ${bridgePid} 2>/dev/null)`,
+            `if [ -n "$bp" ] && tr '\\0' ' ' < /proc/$bp/cmdline 2>/dev/null | grep -qF ${bridgePath}; then echo "BRIDGE_UP $bp"; else echo BRIDGE_DOWN; fi`,
+            `wp=$(cat ${watchdogPid} 2>/dev/null)`,
+            `if [ -n "$wp" ] && tr '\\0' ' ' < /proc/$wp/cmdline 2>/dev/null | grep -qF ${watchdogPath}; then echo "WATCHDOG_UP $wp"; else echo WATCHDOG_DOWN; fi`
+        ].join("; ");
+    }
+
+    /** 定向终止单个服务：pidfile → 归属校验 → TERM，超时再 KILL。校验不过只清 pidfile，不发信号。 */
+    function stopCommandFor(pidFileName, scriptFileName) {
+        const dir = serviceDir();
+        const pidFile = shq(dir + "/" + pidFileName);
+        const scriptPath = shq(dir + "/" + scriptFileName);
+        return [
+            `sp=$(cat ${pidFile} 2>/dev/null)`,
+            `if [ -z "$sp" ]; then echo SKIP_NO_PID; elif tr '\\0' ' ' < /proc/$sp/cmdline 2>/dev/null | grep -qF ${scriptPath}; then kill -TERM $sp 2>/dev/null; n=0; while [ $n -lt 20 ] && kill -0 $sp 2>/dev/null; do sleep 0.2; n=$((n+1)); done; kill -0 $sp 2>/dev/null && kill -KILL $sp 2>/dev/null; echo "KILLED $sp"; else echo "SKIP_NOT_OURS $sp"; fi`,
+            `rm -f ${pidFile}`
+        ].join("; ");
+    }
+
+    /** 启动接入服务：已在运行则复用；否则绝对路径启动，PID 由服务自己写入 bridge.pid。 */
+    function startBridgeCommand() {
+        const dir = serviceDir();
+        const serverPath = shq(dir + "/server.mjs");
+        const logPath = shq(dir + "/bridge.log");
+        const pidFile = shq(dir + "/" + BRIDGE_PID_FILE_NAME);
+        return `pb=$(cat ${pidFile} 2>/dev/null); if [ -n "$pb" ] && tr '\\0' ' ' < /proc/$pb/cmdline 2>/dev/null | grep -qF ${serverPath}; then echo "BRIDGE_PID=$pb"; else cd ${shq(dir)} && nohup node ${serverPath} >> ${logPath} 2>&1 & sleep 3; echo "BRIDGE_PID=$(cat ${pidFile} 2>/dev/null)"; fi`;
+    }
+
+    /** 启动守护：已在运行则复用；watchdog.sh 自己写 watchdog.pid。 */
+    function startWatchdogCommand() {
+        const dir = serviceDir();
+        const watchdogPath = shq(dir + "/watchdog.sh");
+        const pidFile = shq(dir + "/" + WATCHDOG_PID_FILE_NAME);
+        return `pw=$(cat ${pidFile} 2>/dev/null); if [ -n "$pw" ] && tr '\\0' ' ' < /proc/$pw/cmdline 2>/dev/null | grep -qF ${watchdogPath}; then echo "WATCHDOG_PID=$pw"; else rm -f ${pidFile}; cd ${shq(dir)} && nohup bash ${watchdogPath} >/dev/null 2>&1 & sleep 2; echo "WATCHDOG_PID=$(cat ${pidFile} 2>/dev/null)"; fi`;
+    }
 
     async function wb_service(params) {
         const action = String(params === undefined || params.action === undefined ? "" : params.action).trim().toLowerCase();
         const dir = serviceDir();
-        const stopCommand = `${WATCHDOG_STOP} ; pkill -f '[n]ode server.mjs' >/dev/null 2>&1 ; sleep 1 ; ${WATCHDOG_PROBE} ; echo stopped`;
-        const startCommand = `cd ${dir} && if ! curl -sS -m 3 ${baseUrl()}/healthz >/dev/null 2>&1 ; then (nohup node server.mjs >> bridge.log 2>&1 &) ; sleep 2 ; fi ; ${WATCHDOG_ENSURE} ; sleep 1 ; ${WATCHDOG_PROBE} ; curl -sS -m 5 ${baseUrl()}/healthz ; echo`;
+        /* 停止顺序：先停守护（否则它下一轮巡检会把服务又拉回来），再停接入服务。
+           两个动作都只认自己的 pidfile，且发信号前校验进程归属。 */
+        const stopCommand = stopCommandFor(WATCHDOG_PID_FILE_NAME, "watchdog.sh") + "; " + stopCommandFor(BRIDGE_PID_FILE_NAME, "server.mjs");
+        /* 启动顺序：先起接入服务，再起守护，最后统一探活。 */
+        const startCommand = startBridgeCommand() + "; " + startWatchdogCommand();
         if (action === "status") {
             let serviceUp = false;
             let serviceData;
@@ -722,15 +798,23 @@ const WorkBuddyConnect = (function () {
                 /* 服务未运行，走下面的失败分支 */
             }
             let watchdogUp = false;
+            let bridgePid = 0;
+            let watchdogPid = 0;
             try {
-                const probe = await runServiceCommand(WATCHDOG_PROBE, 10000);
-                watchdogUp = probe.indexOf("WATCHDOG_UP") >= 0;
+                const probed = parseServiceProbe(
+                    await runServiceCommand(probeCommand(), 15000)
+                );
+                watchdogUp = probed.watchdogUp;
+                bridgePid = probed.bridgePid;
+                watchdogPid = probed.watchdogPid;
             } catch (error) {
                 /* 终端不可用时只报告服务状态 */
             }
             return {
                 success: serviceUp,
-                message: `接入服务${serviceUp ? "正在运行" : "未运行"}。守护进程${watchdogUp ? "运行中" : "未运行"}。`,
+                message:
+                    `接入服务${bridgePid > 0 ? `运行中（PID ${bridgePid}）` : "未运行"}，健康检查${serviceUp ? "正常" : "无响应"}。` +
+                    `守护进程${watchdogUp ? `运行中（PID ${watchdogPid}）` : "未运行"}。`,
                 data: serviceData
             };
         }
@@ -745,7 +829,14 @@ const WorkBuddyConnect = (function () {
             return fail("服务操作失败", error);
         }
         await new Promise((resolve) => setTimeout(resolve, 1500));
-        const watchdogUp = output.indexOf("WATCHDOG_UP") >= 0;
+        let probed = { bridgeUp: false, bridgePid: 0, watchdogUp: false, watchdogPid: 0 };
+        try {
+            probed = parseServiceProbe(await runServiceCommand(probeCommand(), 15000));
+        } catch (error) {
+            /* 探活失败按未运行处理，不阻断操作结果 */
+        }
+        const watchdogUp = probed.watchdogUp;
+        const bridgePid = probed.bridgePid;
         if (action === "stop") {
             let stopped = false;
             try {
@@ -772,7 +863,9 @@ const WorkBuddyConnect = (function () {
         if (response.statusCode !== 200) return { success: false, message: `服务启动失败：${output.slice(0, 400)}` };
         return {
             success: true,
-            message: `接入服务已${action === "restart" ? "重启" : "启动"}，守护进程${watchdogUp ? "运行中" : "未运行"}。`,
+            message:
+                `接入服务已${action === "restart" ? "重启" : "启动"}（PID ${bridgePid}），` +
+                `守护进程${watchdogUp ? `运行中（PID ${probed.watchdogPid}）` : "未运行"}。`,
             data: response.json
         };
     }

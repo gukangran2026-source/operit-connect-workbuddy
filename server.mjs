@@ -1683,10 +1683,37 @@ if (args.includes("--login")) {
   const models = await fetchModels(cred, true);
   for (const model of models) console.log(`${model.id}\t${model.name}\t上下文 ${model.contextWindow}\t输出 ${model.maxTokens}`);
 } else {
+  /* 自持 PID 文件：插件与守护脚本据此做「先校验归属、再定向终止」，
+     不再依赖 pkill 按进程名批量匹配。任何启动路径都会留下同一个可信 PID。 */
+  const PID_PATH = path.join(HERE, "bridge.pid");
+  const writePidFile = () => {
+    try {
+      fs.writeFileSync(PID_PATH, String(process.pid), "utf8");
+    } catch (error) {
+      console.warn(`[bridge] PID 文件写入失败：${error.message}`);
+    }
+  };
+  const removePidFile = () => {
+    try {
+      const raw = fs.readFileSync(PID_PATH, "utf8").trim();
+      if (raw === String(process.pid)) fs.unlinkSync(PID_PATH);
+    } catch (error) {
+      /* 文件不存在或已被别的实例接管，忽略 */
+    }
+  };
   server.listen(CONFIG.port, CONFIG.host, () => {
+    writePidFile();
     console.log(`[bridge] 监听 http://${CONFIG.host}:${CONFIG.port}`);
+    console.log(`[bridge] PID ${process.pid}，已写入 ${PID_PATH}`);
     console.log(`[bridge] API Key: ${CONFIG.apiKey}`);
     console.log(`[bridge] 国内版 Base URL: http://${CONFIG.host}:${CONFIG.port}/cn/v1`);
     console.log(`[bridge] 国际版 Base URL: http://${CONFIG.host}:${CONFIG.port}/global/v1`);
   });
+  process.on("exit", removePidFile);
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.on(signal, () => {
+      removePidFile();
+      process.exit(0);
+    });
+  }
 }
