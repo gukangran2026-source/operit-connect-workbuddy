@@ -88,20 +88,29 @@
 
 ### 第一步：部署反代服务
 
-把 `server.mjs`、`promotions.json` 与 `watchdog.sh` 放到同一个目录，例如 `/root/workbuddy-bridge/`。
+把 `server.mjs`、`promotions.json`、`watchdog.sh` 与 `start_all.sh` 放到同一个目录，例如 `/root/workbuddy-bridge/`。
 
-启动服务：
+启动全部服务：
+
+```bash
+bash /root/workbuddy-bridge/start_all.sh
+```
+
+也可以只启动接入服务：
 
 ```bash
 cd /root/workbuddy-bridge
-setsid node server.mjs > bridge.log 2>&1 &
+setsid node /root/workbuddy-bridge/server.mjs >> bridge.log 2>&1 &
 ```
+
+启动命令必须使用 `server.mjs` 的绝对路径。面板的停止与重启会校验进程归属，要求 cmdline 中出现该绝对路径；用相对路径启动的进程会被判定为不属于本服务，因而不受面板管理。
 
 首次启动会自动生成 `config.json`，其中包含随机 API Key 与默认端口 8787。
 
 检查服务状态：
 
 ```bash
+bash /root/workbuddy-bridge/start_all.sh --status
 curl -sS http://127.0.0.1:8787/healthz
 ```
 
