@@ -1,7 +1,7 @@
 /* METADATA
 {
     "name": "connect_workbuddy",
-    "version": "4.8.2",
+    "version": "4.8.3",
     "author": ["gukangran2026-source"],
     "display_name": {
         "zh": "operit-connect-workbuddy",
@@ -255,6 +255,8 @@ const WorkBuddyConnect = (function () {
     const DEFAULT_BASE = "http://127.0.0.1:8787";
     const DEFAULT_DIR = "/root/workbuddy-bridge";
     const REGION_LABELS = { cn: "国内版", global: "国际版" };
+    /** 读不到 API Key 时抛出的固定标记，用文案本身当标识，避免额外状态位。 */
+    const KEY_UNAVAILABLE = "__WORKBUDDY_KEY_UNAVAILABLE__";
 
     function readEnv(key) {
         if (typeof getEnv !== "function") return undefined;
@@ -282,26 +284,38 @@ const WorkBuddyConnect = (function () {
     /**
      * 解析接入服务 API Key。优先级：
      *   1) 环境变量 WORKBUDDY_BRIDGE_KEY
-     *   2) 服务端 config.json 中的 apiKey（自动读取，用户无需手填）
-     * 结果会缓存；force=true 时强制重读（用于服务端换 key 后的重试）。
+     *   2) 服务端 config.json 中的 apiKey
+     * 读取失败返回 null（区别于“读到空值”），由调用方决定如何处理。
+     * 早先实现把失败当成空字符串返回，导致 wb_sync_config 把空 key 写进模型配置，
+     * 而宿主对 api_key 传空字符串会清空原值，配置因此被静默改坏。
      */
     async function resolveApiKey(force) {
         const raw = readEnv("WORKBUDDY_BRIDGE_KEY");
         if (raw !== undefined && raw.trim() !== "") return raw.trim();
         if (force !== true && cachedKey !== undefined) return cachedKey;
-        let key = "";
+        let key = null;
         try {
             const session = await Tools.System.terminal.create("workbuddy_bridge_key");
-            const result = await Tools.System.terminal.exec(session.sessionId, `cat ${serviceDir()}/config.json`, 15000);
-            const text = String(result.output === undefined || result.output === null ? "" : result.output);
-            const parsed = JSON.parse(text);
-            if (parsed !== null && typeof parsed === "object" && typeof parsed.apiKey === "string") {
-                key = parsed.apiKey;
+            /* 终端回传的输出有长度上限（实测约 207 字节），多行 cat 会被截断。
+           只取 apiKey 本身，输出压到最短，避免 JSON 因截断而解析失败。
+           2>/dev/null 丢弃 grep 的报错，否则文件缺失时错误信息会被误当成 key。 */
+            const cmd = `grep -o '"apiKey"[[:space:]]*:[[:space:]]*"[^"]*"' ${shq(serviceDir())}/config.json 2>/dev/null | head -n1 | sed 's/.*"\\([^"]*\\)"$/\\1/'`;
+            const result = await Tools.System.terminal.exec(session.sessionId, cmd, 15000);
+            const text = String(result.output === undefined || result.output === null ? "" : result.output).trim();
+            /* 只接受“像 key 的单行”：仅字母数字与常见 key 符号，长度 8~256，
+               避免把终端提示、报错等噪声当成 key。 */
+            const candidates = text.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+            const raw = candidates.length === 0 ? "" : candidates[candidates.length - 1];
+            if (/^[A-Za-z0-9_.~+/=:-]{8,256}$/.test(raw)) {
+                key = raw;
             }
         } catch (error) {
-            key = "";
+            key = null;
         }
-        cachedKey = key;
+        /* 只缓存成功读到的值；失败不写缓存，下次还能重试。 */
+        if (key !== null) {
+            cachedKey = key;
+        }
         return key;
     }
 
@@ -326,6 +340,9 @@ const WorkBuddyConnect = (function () {
     /** 连接类失败换成环境自检文案；上游业务错误保留原前缀，避免掩盖真实原因。 */
     async function failWithHint(prefix, error) {
         const text = String(error === undefined || error === null ? "" : error);
+        if (text.indexOf(KEY_UNAVAILABLE) >= 0) {
+            return { success: false, message: keyUnavailableMessage(), data: { keyAvailable: false } };
+        }
         if (/connect|ECONNREFUSED|ETIMEDOUT|timed out/i.test(text)) {
             const setup = await readSetupDiagnosis();
             return {
@@ -335,6 +352,13 @@ const WorkBuddyConnect = (function () {
             };
         }
         return fail(prefix, error);
+    }
+    /** 读不到 key 时的统一提示，说明原因和两种补救办法。 */
+    function keyUnavailableMessage() {
+        return (
+            `读不到接入服务的 API Key。请确认 ${serviceDir()}/config.json 可读，` +
+            `或在插件环境变量 WORKBUDDY_BRIDGE_KEY 中手动填写后重试。`
+        );
     }
 
     /** 写入系统剪贴板；不可用时返回 false，不抛异常。 */
@@ -398,12 +422,22 @@ const WorkBuddyConnect = (function () {
             };
         };
         let key = "";
-        if (opts.auth === true) key = await resolveApiKey(false);
+        if (opts.auth === true) {
+            const resolved = await resolveApiKey(false);
+            /* 读不到 key 时不要发一个必然 401 的请求，直接把原因说清楚。 */
+            if (resolved === null) {
+                throw new Error(KEY_UNAVAILABLE);
+            }
+            key = resolved;
+        }
         let response = await send(key);
         /* 服务端 key 变更后自愈：401 时强制重读一次 config.json 再试 */
         if (opts.auth === true && response.statusCode === 401) {
-            key = await resolveApiKey(true);
-            response = await send(key);
+            const retried = await resolveApiKey(true);
+            if (retried !== null && retried !== "") {
+                key = retried;
+                response = await send(key);
+            }
         }
         return response;
     }
@@ -429,6 +463,8 @@ const WorkBuddyConnect = (function () {
             return { success: false, message: `接入服务响应异常：HTTP ${response.statusCode}` };
         }
         const regions = response.json.regions === undefined ? {} : response.json.regions;
+        /* 顺带确认 key 可用：读不到时提前说明，避免同步配置时把模型配置写坏。 */
+        const keyOk = (await resolveApiKey(false)) !== null;
         const lines = [];
         for (const region of ["cn", "global"]) {
             const info = regions[region] === undefined ? {} : regions[region];
@@ -438,7 +474,12 @@ const WorkBuddyConnect = (function () {
                 lines.push(`${REGION_LABELS[region]}：未登录`);
             }
         }
-        return { success: true, message: `接入服务正常。\n${lines.join("\n")}`, data: response.json };
+        const tail = keyOk ? "" : `\nAPI Key：读不到，同步模型配置会被拒绝。请检查 ${serviceDir()}/config.json 或设置环境变量 WORKBUDDY_BRIDGE_KEY。`;
+        return {
+            success: true,
+            message: `接入服务正常。\n${lines.join("\n")}${tail}`,
+            data: { ...response.json, keyAvailable: keyOk }
+        };
     }
 
     async function wb_login(params) {
@@ -682,12 +723,23 @@ const WorkBuddyConnect = (function () {
             name: targetName,
             api_provider_type: "OPENAI_GENERIC",
             api_endpoint: `${baseUrl()}/${region}/v1`,
-            api_key: await resolveApiKey(false),
             model_name: modelIds.join(","),
             max_tokens_enabled: true,
             max_tokens: 64000,
             enable_tool_call: true
         };
+        /* 宿主对 api_key 传空字符串会清空原值。key 读不到时宁可整条不同步，
+           也不要把一条能用的配置改成不可用。 */
+        const apiKey = await resolveApiKey(true);
+        if (apiKey === null) {
+            return {
+                success: false,
+                message:
+                    `同步模型配置失败：读不到接入服务的 API Key，未改动现有配置。` +
+                    `请确认 ${serviceDir()}/config.json 可读，或在插件环境变量 WORKBUDDY_BRIDGE_KEY 中手动填写后重试。`
+            };
+        }
+        payload.api_key = apiKey;
         if (contextMultiplier > 0) {
             payload.context_length = contextMultiplier;
             payload.max_context_length = contextMultiplier;
