@@ -1,15 +1,15 @@
 /* METADATA
 {
     "name": "connect_workbuddy",
-    "version": "4.8.1",
+    "version": "4.8.2",
     "author": ["gukangran2026-source"],
     "display_name": {
         "zh": "operit-connect-workbuddy",
         "en": "operit-connect-workbuddy"
     },
     "description": {
-        "zh": "把本机登录的 WorkBuddy 模型接入 Operit，并提供账号、积分与模型概览。国内版与国际版两个区域可并行使用。本项目改编自 dingminhua/dsh-connect-workbuddy（MIT）。",
-        "en": "Connect locally signed-in WorkBuddy models to Operit, with account, credits and model overview. Both regions run in parallel. Adapted from dingminhua/dsh-connect-workbuddy (MIT)."
+        "zh": "把 WorkBuddy 模型接入 Operit，并提供账号、积分与模型概览。国内版与国际版两个区域可并行使用。需先在本机部署反代服务。本项目按 MIT 授权提供，改编自 dingminhua/dsh-connect-workbuddy。",
+        "en": "Connect WorkBuddy models to Operit, with account, credits and model overview. Both regions run in parallel. Requires a locally deployed bridge service. Adapted from dingminhua/dsh-connect-workbuddy (MIT)."
     },
     "enabledByDefault": true,
     "category": "Network",
@@ -319,8 +319,22 @@ const WorkBuddyConnect = (function () {
         return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
     }
 
+    /** 把原始异常附在消息后，便于排查；连接类失败由 failWithHint 覆盖。 */
     function fail(prefix, error) {
         return { success: false, message: `${prefix}：${String(error)}` };
+    }
+    /** 连接类失败换成环境自检文案；上游业务错误保留原前缀，避免掩盖真实原因。 */
+    async function failWithHint(prefix, error) {
+        const text = String(error === undefined || error === null ? "" : error);
+        if (/connect|ECONNREFUSED|ETIMEDOUT|timed out/i.test(text)) {
+            const setup = await readSetupDiagnosis();
+            return {
+                success: false,
+                message: bridgeDownMessage(setup),
+                data: { setup: setup, rawError: text }
+            };
+        }
+        return fail(prefix, error);
     }
 
     /** 写入系统剪贴板；不可用时返回 false，不抛异常。 */
@@ -399,7 +413,17 @@ const WorkBuddyConnect = (function () {
         try {
             response = await call("GET", "/healthz");
         } catch (error) {
-            return fail("接入服务不可达，先确认 workbuddy-bridge 已启动", error);
+            /* 连接失败分三种成因，逐级判断后给出可执行指引，不再直接抛宿主原始异常。 */
+            const setup = await readSetupDiagnosis();
+            return {
+                success: false,
+                message: bridgeDownMessage(setup),
+                data: {
+                    online: false,
+                    setup: setup,
+                    rawError: String(error)
+                }
+            };
         }
         if (response.statusCode !== 200 || response.json === undefined) {
             return { success: false, message: `接入服务响应异常：HTTP ${response.statusCode}` };
@@ -423,7 +447,7 @@ const WorkBuddyConnect = (function () {
         try {
             response = await call("POST", "/admin/login", { body: { region: region } });
         } catch (error) {
-            return fail("发起登录失败", error);
+            return failWithHint("发起登录失败", error);
         }
         if (response.json === undefined || response.json.verificationUri === undefined) {
             const reason = response.json !== undefined && response.json.error !== undefined ? response.json.error : `HTTP ${response.statusCode}`;
@@ -444,7 +468,7 @@ const WorkBuddyConnect = (function () {
         try {
             response = await call("GET", `/admin/login/poll?id=${encodeURIComponent(loginId)}`);
         } catch (error) {
-            return fail("查询登录状态失败", error);
+            return failWithHint("查询登录状态失败", error);
         }
         if (response.json === undefined) return { success: false, message: `查询登录状态失败：HTTP ${response.statusCode}` };
         if (response.json.done !== true) return { success: true, message: "登录尚未完成，稍后再查", data: response.json };
@@ -471,7 +495,7 @@ const WorkBuddyConnect = (function () {
         try {
             response = await call("GET", path, { auth: true });
         } catch (error) {
-            return fail("读取模型目录失败", error);
+            return failWithHint("读取模型目录失败", error);
         }
         if (response.json === undefined || Array.isArray(response.json.models) !== true) {
             const reason = response.json !== undefined && response.json.error !== undefined ? response.json.error.message : `HTTP ${response.statusCode}`;
@@ -507,7 +531,7 @@ const WorkBuddyConnect = (function () {
         try {
             response = await call("POST", `/${region}/v1/chat/completions`, { auth: true, body: body, readTimeout: 180000 });
         } catch (error) {
-            return fail("调用模型失败", error);
+            return failWithHint("调用模型失败", error);
         }
         if (response.json === undefined || Array.isArray(response.json.choices) !== true) {
             let reason = `HTTP ${response.statusCode}`;
@@ -531,7 +555,7 @@ const WorkBuddyConnect = (function () {
         try {
             response = await call("GET", path, { auth: true });
         } catch (error) {
-            return fail("查询积分失败", error);
+            return failWithHint("查询积分失败", error);
         }
         if (response.json === undefined || typeof response.json.total !== "number") {
             const reason = response.json !== undefined && response.json.error !== undefined ? response.json.error.message : `HTTP ${response.statusCode}`;
@@ -557,7 +581,7 @@ const WorkBuddyConnect = (function () {
         try {
             response = await call("GET", path, { auth: true });
         } catch (error) {
-            return fail("查询活动失败", error);
+            return failWithHint("查询活动失败", error);
         }
         const data = response.json;
         if (data === undefined || data === null || typeof data !== "object") {
@@ -598,7 +622,7 @@ const WorkBuddyConnect = (function () {
         try {
             response = await call("POST", `/${region}/admin/checkin`, { auth: true, body: {}, readTimeout: 60000 });
         } catch (error) {
-            return fail("领取失败", error);
+            return failWithHint("领取失败", error);
         }
         const data = response.json;
         if (data === undefined || data === null || typeof data !== "object") {
@@ -628,7 +652,7 @@ const WorkBuddyConnect = (function () {
         try {
             response = await call("GET", `/${region}/admin/catalog?refresh=1`, { auth: true });
         } catch (error) {
-            return fail("同步模型配置失败", error);
+            return failWithHint("同步模型配置失败", error);
         }
         if (response.json === undefined || Array.isArray(response.json.models) !== true) {
             const reason = response.json !== undefined && response.json.error !== undefined ? response.json.error.message : `HTTP ${response.statusCode}`;
@@ -652,7 +676,7 @@ const WorkBuddyConnect = (function () {
             const configs = listed !== null && typeof listed === "object" && Array.isArray(listed.configs) ? listed.configs : [];
             existing = configs.find((item) => item !== null && typeof item === "object" && item.name === targetName);
         } catch (error) {
-            return fail("同步模型配置失败：读取现有配置出错", error);
+            return failWithHint("同步模型配置失败：读取现有配置出错", error);
         }
         const payload = {
             name: targetName,
@@ -686,7 +710,7 @@ const WorkBuddyConnect = (function () {
                 data: { action: "created", configId: configId, modelCount: modelIds.length }
             };
         } catch (error) {
-            return fail("同步模型配置失败：写入配置出错", error);
+            return failWithHint("同步模型配置失败：写入配置出错", error);
         }
     }
 
@@ -731,6 +755,81 @@ const WorkBuddyConnect = (function () {
             watchdogUp: watchdog !== null,
             watchdogPid: watchdog === null ? 0 : Number(watchdog[1])
         };
+    }
+
+    /* ------------------------------------------------------------------ *
+     * 环境自检
+     *
+     * 从市场安装的用户拿不到 server.mjs，也未必装了 Node，连 127.0.0.1 只会
+     * 得到宿主网络层的一条原始异常。这里把失败拆成四种可操作的场景：
+     * 目录不存在 / 缺服务文件 / 缺 Node / 文件齐全但没启动。
+     * ------------------------------------------------------------------ */
+    let setupCache = { at: 0, value: undefined };
+
+    /** 一条命令查清五件事：服务目录、server.mjs、Node、config.json、package.json。 */
+    function diagnoseSetupCommand() {
+        const dir = serviceDir();
+        return [
+            `if [ -d ${shq(dir)} ]; then echo DIR=1; else echo DIR=0; fi`,
+            `if [ -f ${shq(dir + "/server.mjs")} ]; then echo SERVER_MJS=1; else echo SERVER_MJS=0; fi`,
+            `if command -v node >/dev/null 2>&1; then echo NODE=1; echo "NODE_VERSION=$(node -v 2>/dev/null)"; else echo NODE=0; echo NODE_VERSION=; fi`,
+            `if [ -f ${shq(dir + "/config.json")} ]; then echo CONFIG=1; else echo CONFIG=0; fi`,
+            `if [ -f ${shq(dir + "/package.json")} ]; then echo DEPENDENCIES=1; else echo DEPENDENCIES=0; fi`
+        ].join("; ");
+    }
+
+    /** 解析自检输出。终端不可用或输出不完整时返回 undefined，由调用方按未知处理。 */
+    function parseSetup(output) {
+        const text = String(output === undefined || output === null ? "" : output);
+        if (text.indexOf("SERVER_MJS=") < 0) {
+            return undefined;
+        }
+        const pick = (key) => {
+            const matched = new RegExp(key + "=(\\S*)").exec(text);
+            return matched === null ? "" : matched[1];
+        };
+        return {
+            dir: serviceDir(),
+            dirExists: pick("DIR") === "1",
+            serverMjs: pick("SERVER_MJS") === "1",
+            node: pick("NODE") === "1",
+            nodeVersion: pick("NODE_VERSION"),
+            config: pick("CONFIG") === "1",
+            dependencies: pick("DEPENDENCIES") === "1"
+        };
+    }
+
+    /** 读自检结果，60 秒内复用，避免每次失败都新开一个终端会话。 */
+    async function readSetupDiagnosis() {
+        const now = Date.now();
+        if (setupCache.value !== undefined && now - setupCache.at < 60000) {
+            return setupCache.value;
+        }
+        let value;
+        try {
+            value = parseSetup(await runServiceCommand(diagnoseSetupCommand(), 15000));
+        } catch (error) {
+            value = undefined;
+        }
+        setupCache = { at: now, value: value };
+        return value;
+    }
+
+    /** 把连接失败翻译成能照着做的一句话。三级判断：没目录 → 没文件 → 没 Node。 */
+    function bridgeDownMessage(setup) {
+        if (setup === undefined) {
+            return "接入服务未运行：无法读取服务目录，终端不可用或服务目录未配置。部署步骤见项目主页「安装」第一章。";
+        }
+        if (setup.dirExists !== true) {
+            return `接入服务尚未部署：服务目录 ${setup.dir} 不存在。部署步骤见项目主页「安装」第一章。`;
+        }
+        if (setup.serverMjs !== true) {
+            return `接入服务尚未部署：${setup.dir} 下缺少 server.mjs。部署步骤见项目主页「安装」第一章。`;
+        }
+        if (setup.node !== true) {
+            return `接入服务无法启动：${setup.dir} 下已有服务文件，但本机未找到 Node.js。安装 Node.js 后执行 node ${setup.dir}/server.mjs。`;
+        }
+        return `接入服务未启动：服务文件与 Node.js 均已就绪。执行 node ${setup.dir}/server.mjs，或在面板点「启动服务」。`;
     }
 
     /** 探活：只认 pidfile + cmdline 里本目录的绝对路径，不按进程名扫。 */
@@ -810,11 +909,18 @@ const WorkBuddyConnect = (function () {
             } catch (error) {
                 /* 终端不可用时只报告服务状态 */
             }
+            const setup = serviceUp ? undefined : await readSetupDiagnosis();
+            if (serviceData === undefined) {
+                serviceData = { online: false, setup: setup };
+            } else {
+                serviceData.online = true;
+                serviceData.setup = setup;
+            }
             return {
                 success: serviceUp,
-                message:
-                    `接入服务${bridgePid > 0 ? `运行中（PID ${bridgePid}）` : "未运行"}，健康检查${serviceUp ? "正常" : "无响应"}。` +
-                    `守护进程${watchdogUp ? `运行中（PID ${watchdogPid}）` : "未运行"}。`,
+                message: serviceUp
+                    ? `接入服务运行中（PID ${bridgePid}），健康检查正常。守护进程${watchdogUp ? `运行中（PID ${watchdogPid}）` : "未运行"}。`
+                    : bridgeDownMessage(setup),
                 data: serviceData
             };
         }
@@ -826,7 +932,7 @@ const WorkBuddyConnect = (function () {
         try {
             output = await runServiceCommand(command, 45000);
         } catch (error) {
-            return fail("服务操作失败", error);
+            return failWithHint("服务操作失败", error);
         }
         await new Promise((resolve) => setTimeout(resolve, 1500));
         let probed = { bridgeUp: false, bridgePid: 0, watchdogUp: false, watchdogPid: 0 };

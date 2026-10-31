@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "toolpkg_id": "com.operit.connect_workbuddy",
-  "version": "4.8.1",
+  "version": "4.8.2",
   "api_version": "1.0.0",
   "author": ["gukangran2026-source"],
   "main": "dist/main.js",
@@ -10,8 +10,8 @@
     "en": "operit-connect-workbuddy"
   },
   "description": {
-    "zh": "把本机登录的 WorkBuddy 模型接入 Operit。侧边栏入口可直接查看账号状态、发起登录、读取模型清单与积分。国内版与国际版两个区域并行使用。本项目改编自 dingminhua/dsh-connect-workbuddy（MIT）。",
-    "en": "Connect locally signed-in WorkBuddy models to Operit. Sidebar entry for account status, sign-in, model catalog and credits. Both regions run in parallel. Adapted from dingminhua/dsh-connect-workbuddy (MIT)."
+    "zh": "把 WorkBuddy 模型接入 Operit。侧边栏入口可查看账号状态、发起登录、读取模型清单、积分与限时活动。国内版与国际版两个区域并行使用。需先在本机部署反代服务，步骤见项目主页。本项目按 MIT 授权提供，改编自 dingminhua/dsh-connect-workbuddy。",
+    "en": "Connect WorkBuddy models to Operit. Sidebar entry for account status, sign-in, model catalog, credits and limited-time events. Both regions run in parallel. Requires a locally deployed bridge service; see the project home for setup. Adapted from dingminhua/dsh-connect-workbuddy (MIT)."
   },
   "enabled_by_default": true,
   "subpackages": [

@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.default = Screen;
 
 const SUB_PACKAGE = "workbuddy_tools";
+const PROJECT_HOME = "https://github.com/gukangran2026-source/operit-connect-workbuddy";
 const REGION_LABELS = { cn: "国内版", global: "国际版" };
 const SETTLE_MS = 250;
 
@@ -146,6 +147,7 @@ function Screen(ctx) {
     const serviceOkState = useStateValue(ctx, "serviceOk", false);
     const serviceTextState = useStateValue(ctx, "serviceText", "");
     const serviceBusyState = useStateValue(ctx, "serviceBusy", "");
+    const setupState = useStateValue(ctx, "setup", "");
     const serviceErrorState = useStateValue(ctx, "serviceError", "");
     const regionState = {
         cn: makeRegionState(ctx, "cn"),
@@ -231,8 +233,12 @@ function Screen(ctx) {
 
     const syncService = async () => {
         const result = await callTool("wb_status");
-        serviceOkState.set(successOf(result));
-        serviceTextState.set(successOf(result) ? "接入服务正在运行" : messageOf(result, "接入服务无响应"));
+        const ok = successOf(result);
+        serviceOkState.set(ok);
+        serviceTextState.set(ok ? "接入服务正在运行" : messageOf(result, "接入服务无响应"));
+        /* 服务不可用时保存自检结果，交给下面的自检卡片渲染；服务正常时清空。 */
+        const setup = dataOf(result).setup;
+        setupState.set(!ok && typeof setup === "object" && setup !== null ? JSON.stringify(setup) : "");
     };
 
     const refreshService = () => runService("刷新", syncService);
@@ -594,6 +600,77 @@ function Screen(ctx) {
         ]),
     ]);
 
+    /**
+     * 首次使用自检卡片：只在服务不可用且已拿到自检结果时出现。
+     * 逐项列出服务目录、server.mjs、Node.js、config.json 的就绪状态，
+     * 并给出部署文档入口，避免把「没部署」误判成「插件坏了」。
+     */
+    const setupCard = () => {
+        if (serviceOkState.value || setupState.value === "") {
+            return null;
+        }
+        let setup;
+        try {
+            setup = JSON.parse(setupState.value);
+        } catch (error) {
+            return null;
+        }
+        if (setup === null || typeof setup !== "object") {
+            return null;
+        }
+        const mark = (label, ok, detail) =>
+            ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
+                ctx.UI.Icon({ name: ok ? "checkCircle" : "error", tint: ok ? "primary" : "error" }),
+                ctx.UI.Spacer({ width: 10 }),
+                ctx.UI.Column({ weight: 1, spacing: 2 }, [
+                    ctx.UI.Text({ text: label, style: "bodyMedium", color: "onSurface" }),
+                ]),
+                ctx.UI.Text({
+                    text: detail,
+                    style: "labelMedium",
+                    color: ok ? "onSurfaceVariant" : "error",
+                }),
+            ]);
+        const nodeDetail =
+            setup.node === true
+                ? typeof setup.nodeVersion === "string" && setup.nodeVersion !== ""
+                    ? setup.nodeVersion
+                    : "已就绪"
+                : "未安装";
+        return ctx.UI.Card({ fillMaxWidth: true }, [
+            ctx.UI.Column({ padding: 16, spacing: 10 }, [
+                ctx.UI.Row({ verticalAlignment: "center" }, [
+                    ctx.UI.Icon({ name: "computer", tint: "primary" }),
+                    ctx.UI.Spacer({ width: 10 }),
+                    ctx.UI.Column({ weight: 1, spacing: 2 }, [
+                        ctx.UI.Text({ text: "接入服务需要先部署", style: "titleSmall", fontWeight: "semiBold" }),
+                        ctx.UI.Text({
+                            text: "市场安装只含插件本体，不含本机反代服务。",
+                            style: "labelMedium",
+                            color: "onSurfaceVariant",
+                        }),
+                    ]),
+                ]),
+                mark("服务目录", setup.dirExists === true, setup.dirExists === true ? "已就绪" : "缺失"),
+                mark("服务文件 server.mjs", setup.serverMjs === true, setup.serverMjs === true ? "已就绪" : "缺失"),
+                mark("Node.js 运行时", setup.node === true, nodeDetail),
+                mark("配置文件 config.json", setup.config === true, setup.config === true ? "已就绪" : "缺失"),
+                ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
+                    ctx.UI.Button({
+                        text: "打开部署说明",
+                        weight: 1,
+                        onClick: () => {
+                            runService("打开部署说明", async () => {
+                                await callTool("wb_open", { url: PROJECT_HOME });
+                            });
+                        },
+                    }),
+                    ctx.UI.Spacer({ width: 8 }),
+                    ctx.UI.TextButton({ text: "重新检测", contentColor: "onSurfaceVariant", onClick: refreshService }),
+                ]),
+            ]),
+        ]);
+    };
     const accountCard = (region) => {
         const st = regionState[region];
         const children = [
@@ -1114,14 +1191,21 @@ function Screen(ctx) {
             }),
         ]),
         serviceCard,
+    ];
+    /* 自检卡片紧跟服务卡片：服务正常时不渲染，返回 null 就不入列表。 */
+    const setupView = setupCard();
+    if (setupView !== null) {
+        children.push(setupView);
+    }
+    children.push(
         ctx.UI.PrimaryTabRow({
             selectedTabIndex: active === "global" ? 1 : 0,
             tabs: [tabItem("cn", "国内版"), tabItem("global", "国际版")],
         }),
         accountCard(active),
         modelsCard(active),
-        activityCard(active),
-    ];
+        activityCard(active)
+    );
 
     const err = errorCard(active);
     if (err !== null) {

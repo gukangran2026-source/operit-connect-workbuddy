@@ -31,3 +31,41 @@ The upstream calling logic, authentication header conventions and token
 refresh mechanism are aligned with the original project. The original
 copyright notice is retained here in full compliance with the MIT License
 requirements for redistributed derivative works.
+
+---
+
+ADDITIONAL DISCLAIMER (applies in addition to the MIT warranty disclaimer above)
+
+This Software is provided for personal interoperability and technical study
+only. It is not affiliated with, endorsed by, or sponsored by Tencent,
+WorkBuddy, CodeBuddy, DeepSeek, or Operit. It contains no credentials, keys,
+tokens, accounts, subscriptions, or billable resources, and it does not
+modify, circumvent, or defeat any upstream authentication, authorization,
+billing, or rate-limiting control.
+
+By downloading, installing, running, copying, modifying, or distributing any
+part of this Software, you accept the full disclaimer published in README.md
+("免责声明" section), which includes, without limitation:
+
+  - You are solely responsible for confirming that your use complies with the
+    terms of service of every upstream provider and with the laws of your
+    jurisdiction.
+  - You are solely responsible for the security of your own credentials and
+    for any token stored locally in plaintext by this Software.
+  - You bear all costs (subscription fees, credit consumption, network usage,
+    device wear) arising from your use of this Software.
+  - The authors exclude all liability for upstream API changes, upstream
+    account actions (rate limiting, suspension, termination, chargeback),
+    credential leakage, data loss, service interruption, and any direct,
+    indirect, incidental, consequential, punitive, or lost-profit damages.
+  - The authors' aggregate liability is capped at the amount you actually paid
+    to obtain this Software, which is zero, because it is free open-source
+    software.
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT ANY WARRANTY OF ANY KIND, INCLUDING
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT,
+AVAILABILITY, ACCURACY, OR SECURITY. THE ENTIRE RISK AS TO THE QUALITY AND
+PERFORMANCE OF THIS SOFTWARE IS WITH YOU.
+
+If you do not accept these terms in full, your sole and exclusive remedy is to
+stop using this Software and delete all copies of it.
