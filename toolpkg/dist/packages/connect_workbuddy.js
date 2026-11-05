@@ -1,7 +1,7 @@
 /* METADATA
 {
     "name": "connect_workbuddy",
-    "version": "4.8.3",
+    "version": "4.9.3",
     "author": ["gukangran2026-source"],
     "display_name": {
         "zh": "operit-connect-workbuddy",
@@ -47,6 +47,63 @@
                 "en": "Show bridge service status and sign-in state for both regions."
             },
             "parameters": []
+        },
+        {
+            "name": "wb_accounts",
+            "description": {
+                "zh": "列出国内版与国际版已保存的账号，标明当前使用中的账号。不返回任何令牌。",
+                "en": "List saved accounts for both regions and mark the active one. No tokens are returned."
+            },
+            "parameters": [
+                {
+                    "name": "region",
+                    "description": { "zh": "区域：cn 国内版，global 国际版，留空返回两个区域", "en": "Region: cn or global; empty returns both" },
+                    "type": "string",
+                    "required": false
+                }
+            ]
+        },
+        {
+            "name": "wb_account_use",
+            "description": {
+                "zh": "把指定区域的当前账号切换为另一个已保存账号。切换即时生效。",
+                "en": "Switch the active account of a region to another saved one. Takes effect immediately."
+            },
+            "parameters": [
+                {
+                    "name": "region",
+                    "description": { "zh": "区域：cn 国内版，global 国际版，默认 cn", "en": "Region: cn or global, default cn" },
+                    "type": "string",
+                    "required": false
+                },
+                {
+                    "name": "id",
+                    "description": { "zh": "账号 ID，取值来自 wb_accounts", "en": "Account ID from wb_accounts" },
+                    "type": "string",
+                    "required": true
+                }
+            ]
+        },
+        {
+            "name": "wb_account_remove",
+            "description": {
+                "zh": "删除指定区域的一个已保存账号。删除当前账号时自动切换到剩余账号。",
+                "en": "Remove a saved account of a region. Removing the active one switches to a remaining account."
+            },
+            "parameters": [
+                {
+                    "name": "region",
+                    "description": { "zh": "区域：cn 国内版，global 国际版，默认 cn", "en": "Region: cn or global, default cn" },
+                    "type": "string",
+                    "required": false
+                },
+                {
+                    "name": "id",
+                    "description": { "zh": "账号 ID，取值来自 wb_accounts", "en": "Account ID from wb_accounts" },
+                    "type": "string",
+                    "required": true
+                }
+            ]
         },
         {
             "name": "wb_login",
@@ -177,14 +234,20 @@
         {
             "name": "wb_checkin",
             "description": {
-                "zh": "手动领取指定区域的每日活动奖励。已领取时返回已领取状态，不视为失败。",
-                "en": "Manually claim the daily activity reward for a region. Already-claimed is reported as such, not as a failure."
+                "zh": "手动领取指定区域的每日活动奖励。已领取时返回已领取状态，不视为失败。全部账号可一次领取。",
+                "en": "Manually claim the daily activity reward for a region. Already-claimed is reported as such, not as a failure. Every account can be claimed in one call."
             },
             "parameters": [
                 {
                     "name": "region",
                     "description": { "zh": "区域：cn 国内版，global 国际版，默认 cn", "en": "Region: cn or global, default cn" },
                     "type": "string",
+                    "required": false
+                },
+                {
+                    "name": "all",
+                    "description": { "zh": "为指定区域的全部账号依次领取", "en": "Claim for every account of the region" },
+                    "type": "boolean",
                     "required": false
                 }
             ]
@@ -469,7 +532,9 @@ const WorkBuddyConnect = (function () {
         for (const region of ["cn", "global"]) {
             const info = regions[region] === undefined ? {} : regions[region];
             if (info.signedIn === true) {
-                lines.push(`${REGION_LABELS[region]}：已登录，账号 ${info.account === undefined || info.account === null ? "未知" : info.account}，凭据域 ${info.domain === undefined || info.domain === null ? "未知" : info.domain}`);
+                const accountCount =
+                    typeof info.accountCount === "number" && info.accountCount > 1 ? `，共 ${info.accountCount} 个账号` : "";
+                lines.push(`${REGION_LABELS[region]}：已登录，账号 ${info.account === undefined || info.account === null ? "未知" : info.account}${accountCount}，凭据域 ${info.domain === undefined || info.domain === null ? "未知" : info.domain}`);
             } else {
                 lines.push(`${REGION_LABELS[region]}：未登录`);
             }
@@ -521,6 +586,91 @@ const WorkBuddyConnect = (function () {
             message: `登录成功，账号 ${name === undefined || name === null || name === "" ? "未知" : name}，凭据域 ${account.domain === undefined ? "未知" : account.domain}`,
             data: response.json
         };
+    }
+
+    /** 列出已保存账号，不含令牌。 */
+    async function wb_accounts(params) {
+        const hasRegion = params !== undefined && params.region !== undefined && String(params.region).trim() !== "";
+        const scope = hasRegion ? [normalizeRegion(params.region)] : ["cn", "global"];
+        let response;
+        try {
+            response = await call("GET", "/admin/accounts");
+        } catch (error) {
+            return failWithHint("读取账号清单失败", error);
+        }
+        const data = response.json;
+        if (data === undefined || data === null || typeof data !== "object" || data.accounts === undefined) {
+            return { success: false, message: `读取账号清单失败：HTTP ${response.statusCode}` };
+        }
+        const lines = [];
+        for (const region of scope) {
+            const block = data.accounts[region] === undefined ? { active: "", list: [] } : data.accounts[region];
+            const list = Array.isArray(block.list) ? block.list : [];
+            if (list.length === 0) {
+                lines.push(`${REGION_LABELS[region]}：未登录`);
+                continue;
+            }
+            lines.push(`${REGION_LABELS[region]}：共 ${list.length} 个账号`);
+            for (const item of list) {
+                const name =
+                    item.nickname !== undefined && item.nickname !== null && item.nickname !== ""
+                        ? item.nickname
+                        : String(item.id);
+                const mark = item.active === true ? "当前使用 " : "        ";
+                const expiry = typeof item.expiresAt === "string" ? `，到期 ${item.expiresAt.slice(0, 10)}` : "";
+                lines.push(`${mark}${name}${expiry}，账号 ID ${item.id}`);
+            }
+        }
+        return { success: true, message: lines.join("\n"), data: data };
+    }
+
+    async function wb_account_use(params) {
+        const region = normalizeRegion(params === undefined ? undefined : params.region);
+        const id = String(params === undefined || params.id === undefined ? "" : params.id).trim();
+        if (id === "") return { success: false, message: "缺少参数：id" };
+        let response;
+        try {
+            response = await call("POST", "/admin/accounts/use", { body: { region: region, id: id } });
+        } catch (error) {
+            return failWithHint("切换账号失败", error);
+        }
+        const data = response.json;
+        if (data === undefined || data === null || data.ok !== true) {
+            const reason =
+                data !== undefined && data !== null && typeof data.message === "string"
+                    ? data.message
+                    : `HTTP ${response.statusCode}`;
+            return { success: false, message: `切换账号失败：${reason}` };
+        }
+        const account = data.account === undefined || data.account === null ? {} : data.account;
+        const name =
+            account.nickname !== undefined && account.nickname !== null && account.nickname !== ""
+                ? account.nickname
+                : id;
+        return { success: true, message: `${REGION_LABELS[region]}已切换到账号 ${name}`, data: data };
+    }
+
+    async function wb_account_remove(params) {
+        const region = normalizeRegion(params === undefined ? undefined : params.region);
+        const id = String(params === undefined || params.id === undefined ? "" : params.id).trim();
+        if (id === "") return { success: false, message: "缺少参数：id" };
+        let response;
+        try {
+            response = await call("POST", "/admin/accounts/remove", { body: { region: region, id: id } });
+        } catch (error) {
+            return failWithHint("删除账号失败", error);
+        }
+        const data = response.json;
+        if (data === undefined || data === null || data.ok !== true) {
+            const reason =
+                data !== undefined && data !== null && typeof data.message === "string"
+                    ? data.message
+                    : `HTTP ${response.statusCode}`;
+            return { success: false, message: `删除账号失败：${reason}` };
+        }
+        const remaining = typeof data.remaining === "number" ? data.remaining : 0;
+        const tail = remaining === 0 ? "该区域已无账号" : `剩余 ${remaining} 个账号`;
+        return { success: true, message: `${REGION_LABELS[region]}已删除账号，${tail}`, data: data };
     }
 
     async function wb_models(params) {
@@ -659,6 +809,7 @@ const WorkBuddyConnect = (function () {
     /** 手动领取每日奖励。已领取不算失败，返回 success=true 并带 alreadyClaimed 标记。 */
     async function wb_checkin(params) {
         const region = normalizeRegion(params === undefined ? undefined : params.region);
+        if (params !== undefined && params.all === true) return await checkinAllAccounts(region);
         let response;
         try {
             response = await call("POST", `/${region}/admin/checkin`, { auth: true, body: {}, readTimeout: 60000 });
@@ -681,6 +832,48 @@ const WorkBuddyConnect = (function () {
         const streak =
             typeof data.streakDays === "number" && data.streakDays > 0 ? `，连签 ${data.streakDays} 天` : "";
         return { success: true, message: `${REGION_LABELS[region]}：领取成功${credit}${streak}`, data: data };
+    }
+
+    /** 为指定区域的全部账号依次领取，单个失败不影响其余账号。 */
+    async function checkinAllAccounts(region) {
+        let response;
+        try {
+            response = await call("POST", "/admin/checkin/all", { body: { region: region }, readTimeout: 180000 });
+        } catch (error) {
+            return failWithHint("批量领取失败", error);
+        }
+        const data = response.json;
+        if (data === undefined || data === null || Array.isArray(data.results) !== true) {
+            return { success: false, message: `批量领取失败：HTTP ${response.statusCode}` };
+        }
+        const results = data.results;
+        if (results.length === 0) {
+            return { success: false, message: `${REGION_LABELS[region]}没有已登录账号，无法批量领取`, data: data };
+        }
+        const lines = results.map((item) => {
+            const name =
+                item.nickname !== undefined && item.nickname !== null && item.nickname !== ""
+                    ? item.nickname
+                    : String(item.id);
+            if (item.ok !== true) {
+                const reason = typeof item.message === "string" && item.message !== "" ? item.message : "上游未返回原因";
+                return `${name}：领取失败，${reason}`;
+            }
+            if (item.alreadyClaimed === true) {
+                const reason = typeof item.message === "string" && item.message !== "" ? item.message : "今日已领取";
+                return `${name}：${reason}`;
+            }
+            const credit = typeof item.credit === "number" && item.credit > 0 ? `，获得 ${item.credit} 积分` : "";
+            const streak =
+                typeof item.streakDays === "number" && item.streakDays > 0 ? `，连签 ${item.streakDays} 天` : "";
+            return `${name}：领取成功${credit}${streak}`;
+        });
+        const failed = results.filter((item) => item.ok !== true).length;
+        const head =
+            failed === 0
+                ? `${REGION_LABELS[region]}批量领取完成，共 ${results.length} 个账号`
+                : `${REGION_LABELS[region]}批量领取完成，成功 ${results.length - failed} 个，失败 ${failed} 个`;
+        return { success: failed === 0, message: `${head}\n${lines.join("\n")}`, data: data };
     }
 
     /** 把模型清单同步为 Operit 模型配置，免手动填写。同名配置存在时更新。 */
@@ -1066,6 +1259,9 @@ const WorkBuddyConnect = (function () {
 
     return {
         wb_status: wrap(wb_status),
+        wb_accounts: wrap(wb_accounts),
+        wb_account_use: wrap(wb_account_use),
+        wb_account_remove: wrap(wb_account_remove),
         wb_login: wrap(wb_login),
         wb_login_poll: wrap(wb_login_poll),
         wb_models: wrap(wb_models),
@@ -1081,6 +1277,9 @@ const WorkBuddyConnect = (function () {
     };
 })();
 exports.wb_status = WorkBuddyConnect.wb_status;
+exports.wb_accounts = WorkBuddyConnect.wb_accounts;
+exports.wb_account_use = WorkBuddyConnect.wb_account_use;
+exports.wb_account_remove = WorkBuddyConnect.wb_account_remove;
 exports.wb_login = WorkBuddyConnect.wb_login;
 exports.wb_login_poll = WorkBuddyConnect.wb_login_poll;
 exports.wb_models = WorkBuddyConnect.wb_models;

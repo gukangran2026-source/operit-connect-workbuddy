@@ -87,24 +87,108 @@ function loadConfig() {
 
 const CONFIG = loadConfig();
 
-function loadCreds(region) {
+/**
+ * 凭据文件结构：{ active: "<账号ID>", accounts: { "<账号ID>": { ...凭据 } } }
+ * 旧版单账号文件（顶层直接是凭据）读取时自动迁移为单账号库，不改写磁盘，
+ * 直到下一次保存才落盘为新结构。账号ID 优先取上游 uid，取不到才生成随机值。
+ */
+function accountIdOf(cred) {
+  const uid = String(cred?.uid ?? "").trim();
+  if (uid !== "") return uid;
+  const fallback = String(cred?.accountId ?? "").trim();
+  if (fallback !== "") return fallback;
+  return `acct_${crypto.randomBytes(6).toString("hex")}`;
+}
+function emptyAccountStore() {
+  return { active: "", accounts: {} };
+}
+/** 读取某区域的账号库；旧版单账号自动迁移到内存结构。 */
+function loadAccountStore(region) {
   const file = credsPath(region);
-  if (!fs.existsSync(file)) return null;
+  if (!fs.existsSync(file)) return emptyAccountStore();
+  let parsed;
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (parsed && typeof parsed === "object" && typeof parsed.accessToken === "string" && parsed.accessToken) {
-      return { ...parsed, region };
-    }
+    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
   } catch {
     /* 凭据损坏等同未登录 */
+    return emptyAccountStore();
   }
-  return null;
+  if (parsed === null || typeof parsed !== "object") return emptyAccountStore();
+  if (typeof parsed.accessToken === "string" && parsed.accessToken !== "") {
+    const id = accountIdOf(parsed);
+    return { active: id, accounts: { [id]: { ...parsed, region, accountId: id } } };
+  }
+  const accounts = {};
+  const raw = parsed.accounts !== null && typeof parsed.accounts === "object" ? parsed.accounts : {};
+  for (const [id, value] of Object.entries(raw)) {
+    if (value === null || typeof value !== "object") continue;
+    if (typeof value.accessToken !== "string" || value.accessToken === "") continue;
+    accounts[id] = { ...value, region, accountId: id };
+  }
+  let active = typeof parsed.active === "string" ? parsed.active : "";
+  if (accounts[active] === undefined) active = Object.keys(accounts)[0] ?? "";
+  return { active, accounts };
 }
-
-function saveCreds(region, cred) {
-  fs.writeFileSync(credsPath(region), JSON.stringify(cred, null, 2), { mode: 0o600 });
+function saveAccountStore(region, store) {
+  fs.writeFileSync(credsPath(region), JSON.stringify(store, null, 2), { mode: 0o600 });
 }
-
+/** 当前区域正在使用的凭据。 */
+function loadCreds(region) {
+  const store = loadAccountStore(region);
+  if (store.active === "") return null;
+  const cred = store.accounts[store.active];
+  return cred === undefined ? null : { ...cred, region, accountId: store.active };
+}
+/**
+ * 写入账号。activate 为 false 时不切换当前账号，
+ * 令牌刷新走这条，避免续期把用户正在用的账号切走。
+ */
+function saveCreds(region, cred, options) {
+  const activate = options === undefined || options.activate !== false;
+  const store = loadAccountStore(region);
+  const id = accountIdOf(cred);
+  store.accounts[id] = { ...cred, region, accountId: id };
+  if (activate || store.active === "") store.active = id;
+  saveAccountStore(region, store);
+  return id;
+}
+/** 账号清单，不含任何令牌。 */
+function listAccounts(region) {
+  const store = loadAccountStore(region);
+  return Object.keys(store.accounts).map((id) => {
+    const cred = store.accounts[id];
+    return {
+      id,
+      active: id === store.active,
+      region,
+      uid: cred.uid ?? null,
+      nickname: cred.nickname ?? null,
+      domain: cred.domain ?? null,
+      enterpriseId: cred.enterpriseId ?? null,
+      savedAt: cred.savedAt ?? null,
+      expiresAt:
+        typeof cred.expiresAtMs === "number" && cred.expiresAtMs > 0
+          ? new Date(cred.expiresAtMs).toISOString()
+          : null,
+    };
+  });
+}
+function setActiveAccount(region, id) {
+  const store = loadAccountStore(region);
+  if (store.accounts[id] === undefined) throw new Error(`账号不存在：${id}`);
+  store.active = id;
+  saveAccountStore(region, store);
+  const account = listAccounts(region).find((item) => item.id === id) ?? null;
+  return { region, active: id, account };
+}
+function removeAccount(region, id) {
+  const store = loadAccountStore(region);
+  if (store.accounts[id] === undefined) throw new Error(`账号不存在：${id}`);
+  delete store.accounts[id];
+  if (store.active === id) store.active = Object.keys(store.accounts)[0] ?? "";
+  saveAccountStore(region, store);
+  return { region, removed: id, active: store.active, remaining: Object.keys(store.accounts).length };
+}
 /* ------------------------------------------------------------------ *
  * 区域与基址
  * ------------------------------------------------------------------ */
@@ -317,13 +401,18 @@ async function refreshToken(cred) {
   if (typeof envelope.data.refreshToken === "string" && envelope.data.refreshToken !== "") next.refreshToken = envelope.data.refreshToken;
   if (typeof envelope.data.domain === "string" && envelope.data.domain !== "") next.domain = envelope.data.domain;
   if (typeof envelope.data.expiresIn === "number" && envelope.data.expiresIn > 0) next.expiresAtMs = Date.now() + envelope.data.expiresIn * 1000;
-  saveCreds(next.region ?? (regionOf(next.domain) === "global" ? "global" : "cn"), next);
+  saveCreds(next.region ?? (regionOf(next.domain) === "global" ? "global" : "cn"), next, { activate: false });
   return next;
 }
 
 /** 取指定区域的可用凭据，必要时先刷新。 */
-async function resolveCredential(region) {
+async function resolveCredential(region, accountId) {
   let cred = loadCreds(region);
+  if (accountId !== undefined && accountId !== "") {
+    const store = loadAccountStore(region);
+    const found = store.accounts[accountId];
+    cred = found === undefined ? null : { ...found, region, accountId };
+  }
   if (cred === null) throw new Error(`尚未登录（${region}）：先执行 node server.mjs --login ${region}`);
   if (typeof cred.expiresAtMs === "number" && cred.expiresAtMs > 0 && cred.expiresAtMs - Date.now() < REFRESH_MARGIN_MS) {
     cred = await refreshToken(cred);
@@ -727,7 +816,10 @@ function writeCacheFile(data) {
 const diskCache = readCacheFile();
 
 function cacheKeyOf(region) {
-  return region === "global" ? "global" : "cn";
+  const base = region === "global" ? "global" : "cn";
+  const store = loadAccountStore(base);
+  /* 缓存按账号隔离：切换账号后不会串用上一个账号的模型目录与积分 */
+  return store.active === "" ? base : `${base}:${store.active}`;
 }
 
 /** 读取上次成功拉取的模型目录；没有则返回 undefined。 */
@@ -1123,6 +1215,29 @@ async function claimCheckin(cred) {
  * ------------------------------------------------------------------ */
 
 const loginSessions = new Map();
+/** 批量签到：逐个账号领取，互不影响，失败只记录原因。 */
+async function checkinAllAccounts(region) {
+  const accounts = listAccounts(region);
+  const results = [];
+  for (const item of accounts) {
+    try {
+      const cred = await resolveCredential(region, item.id);
+      const result = await claimCheckin(cred);
+      results.push({ id: item.id, nickname: item.nickname, domain: item.domain, ...result });
+    } catch (error) {
+      results.push({
+        id: item.id,
+        nickname: item.nickname,
+        domain: item.domain,
+        region,
+        ok: false,
+        alreadyClaimed: false,
+        message: String(error instanceof Error ? error.message : error),
+      });
+    }
+  }
+  return results;
+}
 
 function oauthBillingBase(region, explicitBase) {
   if (region === "cn") return CN_BILLING_BASE;
@@ -1447,13 +1562,16 @@ const server = http.createServer(async (req, res) => {
       const regions = {};
       for (const candidate of REGIONS) {
         const cred = loadCreds(candidate);
+        const accounts = listAccounts(candidate);
         regions[candidate] =
           cred === null
-            ? { signedIn: false }
+            ? { signedIn: false, accountCount: accounts.length, accountId: null }
             : {
                 signedIn: true,
                 domain: cred.domain ?? null,
                 account: cred.nickname ?? cred.uid ?? null,
+                accountId: cred.accountId ?? null,
+                accountCount: accounts.length,
                 expiresAt: cred.expiresAtMs ? new Date(cred.expiresAtMs).toISOString() : null,
               };
       }
@@ -1479,6 +1597,48 @@ const server = http.createServer(async (req, res) => {
       const id = new URL(req.url, "http://localhost").searchParams.get("id") ?? "";
       const result = await oauthPoll(id);
       sendJson(res, 200, result);
+      return;
+    }
+    /* 多账号：列出、切换、删除、批量签到。只走 loopback，不返回任何令牌。 */
+    if (req.method === "GET" && url === "/admin/accounts") {
+      const accounts = {};
+      for (const candidate of REGIONS) {
+        const store = loadAccountStore(candidate);
+        accounts[candidate] = { active: store.active, list: listAccounts(candidate) };
+      }
+      sendJson(res, 200, { ok: true, accounts });
+      return;
+    }
+    if (req.method === "POST" && url === "/admin/accounts/use") {
+      const body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      const useRegion = body.region === "global" ? "global" : "cn";
+      try {
+        sendJson(res, 200, Object.assign({ ok: true }, setActiveAccount(useRegion, String(body.id ?? ""))));
+      } catch (error) {
+        sendJson(res, 404, { ok: false, message: String(error instanceof Error ? error.message : error) });
+      }
+      return;
+    }
+    if (req.method === "POST" && url === "/admin/accounts/remove") {
+      const body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      const removeRegion = body.region === "global" ? "global" : "cn";
+      try {
+        sendJson(res, 200, Object.assign({ ok: true }, removeAccount(removeRegion, String(body.id ?? ""))));
+      } catch (error) {
+        sendJson(res, 404, { ok: false, message: String(error instanceof Error ? error.message : error) });
+      }
+      return;
+    }
+    if (req.method === "POST" && url === "/admin/checkin/all") {
+      const body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      const allRegion = body.region === "global" ? "global" : "cn";
+      const results = await checkinAllAccounts(allRegion);
+      sendJson(res, 200, {
+        region: allRegion,
+        ok: results.length > 0 && results.every((item) => item.ok),
+        total: results.length,
+        results,
+      });
       return;
     }
     if (req.method === "GET" && url === "/admin/catalog") {
@@ -1673,8 +1833,18 @@ if (args.includes("--login")) {
   }
 } else if (args.includes("--status")) {
   for (const r of REGIONS) {
-    const cred = loadCreds(r);
-    console.log(cred === null ? `${r}: 未登录` : `${r}: ${cred.nickname ?? cred.uid} @ ${cred.domain}  到期 ${cred.expiresAtMs ? new Date(cred.expiresAtMs).toISOString() : "未知"}`);
+    const accounts = listAccounts(r);
+    if (accounts.length === 0) {
+      console.log(`${r}: 未登录`);
+      continue;
+    }
+    console.log(`${r}: 共 ${accounts.length} 个账号`);
+    for (const item of accounts) {
+      const expires = item.expiresAt === null ? "未知" : item.expiresAt;
+      console.log(
+        `  ${item.active ? "*" : " "} ${item.nickname ?? item.uid ?? item.id} @ ${item.domain ?? "未知域名"}  到期 ${expires}`
+      );
+    }
   }
 } else if (args.includes("--models")) {
   const idx = args.indexOf("--models");

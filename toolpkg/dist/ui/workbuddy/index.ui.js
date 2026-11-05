@@ -81,6 +81,16 @@ function parseModels(json) {
     }
 }
 /** 积分是浮点数，去掉二进制浮点误差留下的长尾。 */
+function parseAccounts(json) {
+    if (typeof json !== "string" || json === "") return [];
+    try {
+        const parsed = JSON.parse(json);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+        return [];
+    }
+}
+
 function formatCredits(value) {
     const rounded = Math.round(value * 100) / 100;
     return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
@@ -135,6 +145,7 @@ function makeRegionState(ctx, region) {
         modelsExpanded: useStateValue(ctx, `${region}_modelsExpanded`, false),
         activityJson: useStateValue(ctx, `${region}_activityJson`, ""),
         activityExpanded: useStateValue(ctx, `${region}_activityExpanded`, false),
+        accountsJson: useStateValue(ctx, `${region}_accountsJson`, ""),
         busy: useStateValue(ctx, `${region}_busy`, ""),
         error: useStateValue(ctx, `${region}_error`, ""),
     };
@@ -162,6 +173,65 @@ function Screen(ctx) {
     const closeDetail = () => {
         detailTitleState.set("");
         detailBodyState.set("");
+    };
+
+    /**
+     * 危险操作统一走确认弹窗。
+     * 状态里只存可序列化的动作描述，不存函数：跨重组能保留，也不会因为闭包
+     * 失效而点不动。真正的分发在 acceptConfirm 里按 kind 走。
+     */
+    const confirmState = useStateValue(ctx, "confirmAction", "");
+
+    const requestConfirm = (payload) => {
+        try {
+            confirmState.set(JSON.stringify(payload));
+        } catch (error) {
+            confirmState.set("");
+        }
+    };
+
+    const parseConfirm = (json) => {
+        if (typeof json !== "string" || json === "") {
+            return null;
+        }
+        try {
+            const parsed = JSON.parse(json);
+            if (parsed === null || typeof parsed !== "object" || typeof parsed.kind !== "string") {
+                return null;
+            }
+            return parsed;
+        } catch (error) {
+            return null;
+        }
+    };
+
+    const cancelConfirm = () => confirmState.set("");
+
+    const acceptConfirm = () => {
+        const pending = parseConfirm(confirmState.value);
+        confirmState.set("");
+        if (pending === null) {
+            return;
+        }
+        if (pending.kind === "service.restart") {
+            controlService("restart");
+            return;
+        }
+        if (pending.kind === "service.stop") {
+            controlService("stop");
+            return;
+        }
+        if (pending.kind === "account.remove") {
+            removeAccount(pending.region, pending.id);
+            return;
+        }
+        if (pending.kind === "config.sync") {
+            syncConfig(pending.region, false);
+            return;
+        }
+        if (pending.kind === "checkin.all") {
+            claimAllAccounts(pending.region);
+        }
     };
 
     const callToolOnce = async (toolName, params) => {
@@ -243,8 +313,9 @@ function Screen(ctx) {
 
     const refreshService = () => runService("刷新", syncService);
 
+    /* 忙态文案跟着动作走：启动 / 停止 / 重启三个动作各自独立。 */
     const controlService = (action) =>
-        runService(action === "start" ? "启动" : "重启", async () => {
+        runService(action === "start" ? "启动" : action === "stop" ? "停止" : "重启", async () => {
             await callTool("wb_service", { action: action });
             await syncService();
         });
@@ -425,11 +496,68 @@ function Screen(ctx) {
             );
         });
 
+    /** 读取账号列表，写入状态供账号卡片渲染。 */
+    const loadAccounts = async (region) => {
+        const st = regionState[region];
+        const result = await callTool("wb_accounts", { region: region });
+        if (successOf(result) !== true) return;
+        const data = dataOf(result);
+        const blocks = data !== undefined && data !== null && typeof data.accounts === "object" && data.accounts !== null ? data.accounts : {};
+        const block = blocks[region] === undefined || blocks[region] === null ? {} : blocks[region];
+        st.accountsJson.set(JSON.stringify(Array.isArray(block.list) ? block.list : []));
+    };
+
+    const switchAccount = (region, id) =>
+        runRegion(region, "切换账号", async () => {
+            const st = regionState[region];
+            const result = await callTool("wb_account_use", { region: region, id: id });
+            if (successOf(result) !== true) {
+                st.error.set(`切换账号失败：${messageOf(result, "上游未返回原因")}`);
+                return;
+            }
+            await loadAccounts(region);
+            await syncRegion(region);
+            await syncModelsQuietly(region);
+            await syncActivityQuietly(region);
+            showDetail(`${REGION_LABELS[region]}账号切换`, messageOf(result, "已切换"));
+        });
+
+    const removeAccount = (region, id) =>
+        runRegion(region, "删除账号", async () => {
+            const st = regionState[region];
+            const result = await callTool("wb_account_remove", { region: region, id: id });
+            if (successOf(result) !== true) {
+                st.error.set(`删除账号失败：${messageOf(result, "上游未返回原因")}`);
+                return;
+            }
+            await loadAccounts(region);
+            await syncRegion(region);
+            await syncModelsQuietly(region);
+            showDetail(`${REGION_LABELS[region]}删除账号`, messageOf(result, "已删除"));
+        });
+
+    const claimAllAccounts = (region) =>
+        runRegion(region, "全部领取", async () => {
+            const st = regionState[region];
+            const result = await callTool("wb_checkin", { region: region, all: true });
+            const data = dataOf(result);
+            const hasDetail = data !== undefined && data !== null && Array.isArray(data.results);
+            if (successOf(result) !== true && hasDetail !== true) {
+                st.error.set(`批量领取失败：${messageOf(result, "上游未返回原因")}`);
+                return;
+            }
+            st.error.set("");
+            await syncRegion(region);
+            await syncActivityQuietly(region);
+            showDetail(`${REGION_LABELS[region]}全部账号领取`, messageOf(result, "已执行"));
+        });
+
     const refreshRegion = (region) =>
         runRegion(region, "刷新状态", async () => {
             await showCachedRegion(region);
             await showCachedActivity(region);
             await syncRegion(region);
+            await loadAccounts(region);
             await syncActivityQuietly(region);
         });
 
@@ -566,6 +694,21 @@ function Screen(ctx) {
             onClick: () => showDetail(title, body),
         });
 
+    /* 卡片标题统一走这里：图标 + 标题，右侧挂一个操作。
+       保证四张卡片的左边距、图标尺寸、标题基线完全一致。 */
+    const cardTitle = (iconName, text, trailing) => {
+        const children = [
+            ctx.UI.Icon({ name: iconName, tint: "primary" }),
+            ctx.UI.Spacer({ width: 10 }),
+            ctx.UI.Text({ text: text, style: "titleMedium", fontWeight: "semiBold", maxLines: 1, overflow: "ellipsis" }),
+        ];
+        if (trailing !== undefined && trailing !== null) {
+            children.push(ctx.UI.Spacer({ weight: 1 }));
+            children.push(trailing);
+        }
+        return ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, children);
+    };
+
     const serviceCard = ctx.UI.Card({ fillMaxWidth: true }, [
         ctx.UI.Column({ padding: 16, spacing: 12 }, [
             ctx.UI.Row({ verticalAlignment: "center" }, [
@@ -580,22 +723,41 @@ function Screen(ctx) {
                         style: "titleSmall",
                         fontWeight: "semiBold",
                         color: serviceOkState.value ? "onSurface" : "error",
+                        maxLines: 1,
                     }),
                     ctx.UI.Text({
                         text: serviceTextState.value === "" ? "尚未读取状态" : serviceTextState.value,
                         style: "labelMedium",
                         color: "onSurfaceVariant",
+                        maxLines: 1,
+                        overflow: "ellipsis",
                     }),
                 ]),
             ]),
+            ctx.UI.HorizontalDivider(),
             ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
                 serviceBusyState.value === "刷新"
-                    ? busyIndicator("读取中")
+                    ? ctx.UI.Box({ weight: 1 }, [busyIndicator("读取中")])
                     : serviceOkState.value
                         ? ctx.UI.OutlinedButton({ text: "刷新状态", weight: 1, onClick: refreshService })
                         : ctx.UI.Button({ text: "启动服务", weight: 1, onClick: () => controlService("start") }),
                 ctx.UI.Spacer({ width: 8 }),
-                ctx.UI.TextButton({ text: "重启", contentColor: "onSurfaceVariant", onClick: () => controlService("restart") }),
+                serviceBusyState.value === "重启"
+                    ? ctx.UI.Box({ weight: 1 }, [busyIndicator("重启中")])
+                    : ctx.UI.OutlinedButton({
+                          text: "重启",
+                          weight: 1,
+                          onClick: () => requestConfirm({ kind: "service.restart" }),
+                      }),
+            ]),
+            ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
+                serviceBusyState.value === "停止"
+                    ? busyIndicator("停止中")
+                    : ctx.UI.TextButton({
+                          text: "停止服务",
+                          contentColor: "error",
+                          onClick: () => requestConfirm({ kind: "service.stop" }),
+                      }),
             ]),
         ]),
     ]);
@@ -673,73 +835,201 @@ function Screen(ctx) {
     };
     const accountCard = (region) => {
         const st = regionState[region];
+        const accounts = parseAccounts(st.accountsJson.value);
+        const signedIn = st.signedIn.value === true;
         const children = [
-            ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
-                ctx.UI.Icon({ name: "person", tint: "primary" }),
-                ctx.UI.Spacer({ width: 10 }),
-                ctx.UI.Column({ weight: 1, spacing: 2 }, [
-                    ctx.UI.Text({ text: `${REGION_LABELS[region]}账号`, style: "labelMedium", color: "onSurfaceVariant" }),
-                    ctx.UI.Text({
-                        text: st.accountText.value === "" ? "尚未读取" : st.accountText.value,
-                        style: "bodyLarge",
-                        color: st.signedIn.value ? "onSurface" : "onSurfaceVariant",
-                        maxLines: 1,
-                        overflow: "ellipsis",
-                    }),
-                ]),
-                ctx.UI.Spacer({ width: 12 }),
-                ctx.UI.Column({ horizontalAlignment: "end", spacing: 2 }, [
-                    ctx.UI.Text({
-                        text: st.creditsText.value === "" ? "—" : st.creditsText.value,
-                        style: "headlineSmall",
-                        fontWeight: "bold",
-                        color: "primary",
-                        maxLines: 1,
-                        overflow: "ellipsis",
-                    }),
-                    ctx.UI.Text({ text: "剩余积分", style: "labelSmall", color: "onSurfaceVariant" }),
-                ]),
-            ]),
-            ctx.UI.Row({ verticalAlignment: "center" }, [
-                detailChip(
-                    `${REGION_LABELS[region]}账号`,
-                    `账号：${st.accountText.value === "" ? "未知" : st.accountText.value}\n积分：${st.creditsText.value === "" ? "未知" : st.creditsText.value}\n\n${st.creditsDetail.value === "" ? "无积分明细" : st.creditsDetail.value}`
-                ),
-                ctx.UI.Spacer({ weight: 1 }),
+            cardTitle(
+                "person",
+                `${REGION_LABELS[region]}账号`,
                 st.busy.value === "刷新状态"
                     ? busyIndicator("刷新中")
-                    : ctx.UI.TextButton({ text: "刷新", onClick: () => refreshRegion(region) }),
-            ]),
-            ctx.UI.HorizontalDivider(),
-            ctx.UI.Row({ fillMaxWidth: true }, [
-                ctx.UI.OutlinedButton({ text: "发起登录", weight: 1, onClick: () => startLogin(region) }),
-                ctx.UI.Spacer({ width: 8 }),
-                ctx.UI.OutlinedButton({ text: "读取模型", weight: 1, onClick: () => loadModels(region, false) }),
-            ]),
+                    : ctx.UI.TextButton({
+                          text: "刷新",
+                          contentColor: "onSurfaceVariant",
+                          onClick: () => refreshRegion(region),
+                      })
+            ),
+            /* 身份块：左边账号与登录状态，右边积分，两块都以中心线对齐。 */
+            ctx.UI.Surface(
+                {
+                    fillMaxWidth: true,
+                    containerColor: "surfaceVariant",
+                    shape: { type: "rounded", cornerRadius: 10 },
+                },
+                [
+                    ctx.UI.Column({ padding: 12, spacing: 8 }, [
+                        ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
+                            ctx.UI.Column({ weight: 1, spacing: 2 }, [
+                                ctx.UI.Text({
+                                    text: st.accountText.value === "" ? "尚未读取" : st.accountText.value,
+                                    style: "bodyLarge",
+                                    fontWeight: "semiBold",
+                                    color: signedIn ? "onSurface" : "onSurfaceVariant",
+                                    maxLines: 1,
+                                    overflow: "ellipsis",
+                                }),
+                                ctx.UI.Text({
+                                    text: signedIn ? "已登录" : "未登录",
+                                    style: "labelSmall",
+                                    color: signedIn ? "primary" : "onSurfaceVariant",
+                                }),
+                            ]),
+                            ctx.UI.Spacer({ width: 12 }),
+                            ctx.UI.Column({ horizontalAlignment: "end", spacing: 2 }, [
+                                ctx.UI.Text({
+                                    text: st.creditsText.value === "" ? "—" : st.creditsText.value,
+                                    style: "headlineSmall",
+                                    fontWeight: "bold",
+                                    color: "primary",
+                                    maxLines: 1,
+                                    overflow: "ellipsis",
+                                }),
+                                ctx.UI.Text({ text: "剩余积分", style: "labelSmall", color: "onSurfaceVariant" }),
+                            ]),
+                        ]),
+                        ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
+                            detailChip(
+                                `${REGION_LABELS[region]}账号`,
+                                `账号：${st.accountText.value === "" ? "未知" : st.accountText.value}\n积分：${st.creditsText.value === "" ? "未知" : st.creditsText.value}\n\n${st.creditsDetail.value === "" ? "无积分明细" : st.creditsDetail.value}`
+                            ),
+                        ]),
+                    ]),
+                ]
+            ),
         ];
-        if (st.loginUrl.value !== "") {
+
+        if (accounts.length > 0) {
+            children.push(ctx.UI.HorizontalDivider());
             children.push(
-                ctx.UI.Row({ padding: { vertical: 6 }, verticalAlignment: "center" }, [
-                    ctx.UI.Icon({ name: "checkCircle", tint: "primary" }),
+                ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
+                    ctx.UI.Text({
+                        text: `已保存 ${accounts.length} 个账号`,
+                        style: "labelLarge",
+                        color: "onSurfaceVariant",
+                    }),
+                    ctx.UI.Spacer({ weight: 1 }),
+                    st.busy.value === "全部领取"
+                        ? busyIndicator("领取中")
+                        : ctx.UI.TextButton({
+                              text: "全部领取",
+                              contentColor: "primary",
+                              onClick: () => requestConfirm({ kind: "checkin.all", region: region }),
+                          }),
+                ])
+            );
+            for (let index = 0; index < accounts.length; index += 1) {
+                const item = accounts[index] === null || accounts[index] === undefined ? {} : accounts[index];
+                const id = item.id === undefined || item.id === null ? "" : String(item.id);
+                const nickname = item.nickname === undefined || item.nickname === null ? "" : String(item.nickname);
+                const name = nickname === "" ? id : nickname;
+                const active = item.active === true;
+                const expiry =
+                    typeof item.expiresAt === "string" && item.expiresAt !== ""
+                        ? `到期 ${item.expiresAt.slice(0, 10)}`
+                        : "长期有效";
+                const rowChildren = [
+                    ctx.UI.Icon({ name: active ? "checkCircle" : "person", tint: active ? "primary" : "onSurfaceVariant" }),
                     ctx.UI.Spacer({ width: 10 }),
-                    ctx.UI.Text({ text: "授权链接已写入剪贴板", style: "labelLarge", color: "primary" }),
-                ])
-            );
-            children.push(ctx.UI.Text({ text: st.loginUrl.value, style: "bodySmall", color: "primary", maxLines: 2, overflow: "ellipsis" }));
-            children.push(
-                ctx.UI.Row({ fillMaxWidth: true }, [
-                    ctx.UI.Button({ text: "打开授权页", weight: 1, onClick: () => openAuthUrl(region) }),
-                    ctx.UI.Spacer({ width: 8 }),
-                    st.busy.value === "确认登录"
-                        ? busyIndicator("确认中")
-                        : ctx.UI.Button({ text: "确认登录", weight: 1, onClick: () => confirmLogin(region) }),
-                ])
-            );
-            children.push(ctx.UI.TextButton({ text: "重新复制链接", contentColor: "onSurfaceVariant", fillMaxWidth: true, onClick: () => copyLoginUrl(region) }));
+                    ctx.UI.Column({ weight: 1, spacing: 1 }, [
+                        ctx.UI.Text({
+                            text: name,
+                            style: "bodyMedium",
+                            fontWeight: active ? "semiBold" : "normal",
+                            color: active ? "primary" : "onSurface",
+                            maxLines: 1,
+                            overflow: "ellipsis",
+                        }),
+                        ctx.UI.Text({
+                            text: active ? `当前使用 · ${expiry}` : expiry,
+                            style: "labelSmall",
+                            color: "onSurfaceVariant",
+                            maxLines: 1,
+                            overflow: "ellipsis",
+                        }),
+                    ]),
+                ];
+                if (active) {
+                    rowChildren.push(ctx.UI.Text({ text: "使用中", style: "labelMedium", color: "primary" }));
+                } else {
+                    rowChildren.push(
+                        st.busy.value === "切换账号"
+                            ? busyIndicator("切换中")
+                            : ctx.UI.TextButton({
+                                  text: "切换",
+                                  contentColor: "primary",
+                                  onClick: () => switchAccount(region, id),
+                              })
+                    );
+                }
+                rowChildren.push(
+                    ctx.UI.TextButton({
+                        text: "删除",
+                        contentColor: "error",
+                        onClick: () => requestConfirm({ kind: "account.remove", region: region, id: id, name: name }),
+                    })
+                );
+                children.push(
+                    ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center", padding: { vertical: 2 } }, rowChildren)
+                );
+            }
         }
+
+        if (st.loginUrl.value !== "") {
+            children.push(ctx.UI.HorizontalDivider());
+            children.push(
+                ctx.UI.Surface(
+                    {
+                        fillMaxWidth: true,
+                        containerColor: "primaryContainer",
+                        contentColor: "onPrimaryContainer",
+                        shape: { type: "rounded", cornerRadius: 10 },
+                    },
+                    [
+                        ctx.UI.Column({ padding: 12, spacing: 8 }, [
+                            ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
+                                ctx.UI.Icon({ name: "checkCircle" }),
+                                ctx.UI.Spacer({ width: 8 }),
+                                ctx.UI.Column({ weight: 1, spacing: 2 }, [
+                                    ctx.UI.Text({ text: "授权链接已复制", style: "labelLarge", fontWeight: "semiBold" }),
+                                    ctx.UI.Text({
+                                        text: st.loginUrl.value,
+                                        style: "labelSmall",
+                                        maxLines: 1,
+                                        overflow: "ellipsis",
+                                    }),
+                                ]),
+                            ]),
+                            ctx.UI.Row({ fillMaxWidth: true }, [
+                                ctx.UI.Button({ text: "打开授权页", weight: 1, onClick: () => openAuthUrl(region) }),
+                                ctx.UI.Spacer({ width: 8 }),
+                                st.busy.value === "确认登录"
+                                    ? ctx.UI.Box({ weight: 1 }, [busyIndicator("确认中")])
+                                    : ctx.UI.Button({ text: "确认登录", weight: 1, onClick: () => confirmLogin(region) }),
+                            ]),
+                            ctx.UI.TextButton({
+                                text: "重新复制链接",
+                                contentColor: "onPrimaryContainer",
+                                onClick: () => copyLoginUrl(region),
+                            }),
+                        ]),
+                    ]
+                )
+            );
+        }
+
+        children.push(ctx.UI.HorizontalDivider());
+        children.push(
+            ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
+                ctx.UI.OutlinedButton({
+                    text: accounts.length > 0 ? "添加账号" : "发起登录",
+                    weight: 1,
+                    onClick: () => startLogin(region),
+                }),
+            ])
+        );
+
         return ctx.UI.Card({ fillMaxWidth: true }, [ctx.UI.Column({ padding: 16, spacing: 12 }, children)]);
     };
-
     const modelRow = (region, model) => {
         const id = model === null || model === undefined || model.id === undefined ? "未知模型" : String(model.id);
         const restricted = model !== null && model !== undefined && model.restricted === true;
@@ -786,31 +1076,32 @@ function Screen(ctx) {
         const models = parseModels(st.modelsJson.value);
         const expanded = st.modelsExpanded.value === true;
         const children = [
-            ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
-                ctx.UI.Icon({ name: "list", tint: "primary" }),
-                ctx.UI.Spacer({ width: 10 }),
-                ctx.UI.Text({ text: `${REGION_LABELS[region]}可用模型`, style: "titleMedium", fontWeight: "semiBold" }),
-                ctx.UI.Spacer({ width: 8 }),
-                ctx.UI.Text({
-                    text: models.length === 0 ? "未读取" : `${models.length} 个`,
-                    style: "labelMedium",
-                    color: "onSurfaceVariant",
-                }),
-                ctx.UI.Spacer({ weight: 1 }),
+            cardTitle(
+                "list",
+                `${REGION_LABELS[region]}模型`,
                 ctx.UI.TextButton({
                     text: expanded ? "收起" : "展开",
                     contentColor: "onSurfaceVariant",
                     onClick: () => toggleModels(region),
-                }),
-            ]),
+                })
+            ),
+            ctx.UI.Text({
+                text: models.length === 0 ? "尚未读取模型清单" : `共 ${models.length} 个可用模型`,
+                style: "labelMedium",
+                color: "onSurfaceVariant",
+            }),
         ];
         if (expanded) {
             children.push(ctx.UI.HorizontalDivider());
             if (models.length === 0) {
                 children.push(
-                    ctx.UI.Column({ padding: { vertical: 10 }, spacing: 4 }, [
-                        ctx.UI.Text({ text: "尚未读取模型清单", style: "bodyMedium", color: "onSurfaceVariant" }),
-                        ctx.UI.Text({ text: "点下方按钮从上游拉取当前可用模型与实时倍率。", style: "labelMedium", color: "onSurfaceVariant" }),
+                    ctx.UI.Column({ padding: { vertical: 8 }, spacing: 4 }, [
+                        ctx.UI.Text({ text: "还没有模型数据", style: "bodyMedium", color: "onSurfaceVariant" }),
+                        ctx.UI.Text({
+                            text: "点下方「读取清单」从上游拉取当前可用模型与实时倍率。",
+                            style: "labelMedium",
+                            color: "onSurfaceVariant",
+                        }),
                     ])
                 );
             } else {
@@ -824,14 +1115,18 @@ function Screen(ctx) {
         }
         children.push(ctx.UI.HorizontalDivider());
         children.push(
-            ctx.UI.Row({ fillMaxWidth: true }, [
+            ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center" }, [
                 st.busy.value === "读取模型"
-                    ? busyIndicator("读取中")
-                    : ctx.UI.OutlinedButton({ text: "读取模型清单", weight: 1, onClick: () => loadModels(region, false) }),
+                    ? ctx.UI.Box({ weight: 1 }, [busyIndicator("读取中")])
+                    : ctx.UI.OutlinedButton({ text: "读取清单", weight: 1, onClick: () => loadModels(region, false) }),
                 ctx.UI.Spacer({ width: 8 }),
                 st.busy.value === "同步配置"
-                    ? busyIndicator("同步中")
-                    : ctx.UI.Button({ text: "同步到配置", weight: 1, onClick: () => syncConfig(region, false) }),
+                    ? ctx.UI.Box({ weight: 1 }, [busyIndicator("同步中")])
+                    : ctx.UI.Button({
+                          text: "同步到配置",
+                          weight: 1,
+                          onClick: () => requestConfirm({ kind: "config.sync", region: region }),
+                      }),
             ])
         );
         children.push(
@@ -1176,6 +1471,49 @@ function Screen(ctx) {
         );
     };
 
+    /* 唯一的确认弹窗：按 kind 取标题、说明、确认按钮文案，取消即清空状态。 */
+    const confirmDialog = () => {
+        const pending = parseConfirm(confirmState.value);
+        if (pending === null) {
+            return null;
+        }
+        const label =
+            pending.region === "global" ? REGION_LABELS.global : pending.region === "cn" ? REGION_LABELS.cn : "";
+        let title = "确认操作";
+        let text = "确认执行该操作。";
+        let confirmText = "确认";
+        if (pending.kind === "service.restart") {
+            title = "重启接入服务";
+            text = "重启会中断正在处理的请求，完成后自动刷新状态。";
+            confirmText = "重启";
+        } else if (pending.kind === "service.stop") {
+            title = "停止接入服务";
+            text = "停止后面板读不到账号与模型，模型请求也会失败，直到重新启动。";
+            confirmText = "停止";
+        } else if (pending.kind === "account.remove") {
+            title = `删除${label}账号`;
+            text = `账号 ${pending.name} 及其保存的凭据会一并删除，恢复需要重新登录。`;
+            confirmText = "删除";
+        } else if (pending.kind === "config.sync") {
+            title = `同步${label}模型配置`;
+            text = "会用当前模型清单覆盖 Operit 里的同名模型配置，已有条目被更新。";
+            confirmText = "同步";
+        } else if (pending.kind === "checkin.all") {
+            title = `${label}全部账号领取`;
+            text = "依次为所有已保存账号执行领取，单个账号失败不影响其他账号。";
+            confirmText = "全部领取";
+        }
+        return ctx.UI.AlertDialog({
+            title: title,
+            text: text,
+            confirmText: confirmText,
+            dismissText: "取消",
+            onConfirm: acceptConfirm,
+            onDismiss: cancelConfirm,
+            onDismissRequest: cancelConfirm,
+        });
+    };
+
     const active = tabState.value === "global" ? "global" : "cn";
     const children = [
         ctx.UI.Column({ spacing: 6 }, [
@@ -1232,19 +1570,9 @@ function Screen(ctx) {
         );
     }
 
-    if (detailTitleState.value !== "") {
-        children.push(
-            ctx.UI.AlertDialog({
-                title: detailTitleState.value,
-                text: detailBodyState.value,
-                confirmText: "关闭",
-                onConfirm: closeDetail,
-                onDismissRequest: closeDetail,
-            })
-        );
-    }
-
-    return ctx.UI.LazyColumn(
+    /* 弹窗不能放进 LazyColumn：列表只组合视口内的项，屏幕外的对话框永远不出现，
+       危险操作的二次确认就会失效。改为外层 Box 叠放，弹窗独立于列表滚动。 */
+    const list = ctx.UI.LazyColumn(
         {
             onLoad: async () => {
                 /* 先秒显磁盘缓存，再拉起服务并拉实时数据 */
@@ -1265,6 +1593,7 @@ function Screen(ctx) {
                 await runService("刷新", async () => {
                     await syncService();
                     await syncRegion(active);
+                    await loadAccounts(active);
                 });
                 await syncModelsQuietly(active);
                 await syncActivityQuietly(active);
@@ -1275,4 +1604,22 @@ function Screen(ctx) {
         },
         children
     );
+
+    const root = [list];
+    const confirmView = confirmDialog();
+    if (confirmView !== null) {
+        root.push(confirmView);
+    }
+    if (detailTitleState.value !== "") {
+        root.push(
+            ctx.UI.AlertDialog({
+                title: detailTitleState.value,
+                text: detailBodyState.value,
+                confirmText: "关闭",
+                onConfirm: closeDetail,
+                onDismissRequest: closeDetail,
+            })
+        );
+    }
+    return ctx.UI.Box({ fillMaxSize: true }, root);
 }
